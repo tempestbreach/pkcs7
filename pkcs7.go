@@ -4,6 +4,7 @@ package pkcs7
 import (
 	"bytes"
 	"crypto"
+	"crypto/subtle"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/des"
@@ -213,19 +214,39 @@ func (p7 *PKCS7) Verify() (err error) {
 		return errors.New("pkcs7: Message has no signers")
 	}
 	for _, signer := range p7.Signers {
-		if err := verifySignature(p7, signer); err != nil {
+		if err := verifySignature(p7, signer, nil); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func verifySignature(p7 *PKCS7, signer signerInfo) error {
+func (p7 *PKCS7) VerifyWithChain(trustStore *x509.CertPool) (err error) {
+	if len(p7.Signers) == 0 {
+		return errors.New("pkcs7: Message has no signers")
+	}
+	for _, signer := range p7.Signers {
+		if err := verifySignature(p7, signer, trustStore); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func verifySignature(p7 *PKCS7, signer signerInfo, trustStore *x509.CertPool) error {
 	signedData := p7.Content
+	// Added
+	ee := getCertFromCertsByIssuerAndSerial(p7.Certificates, signer.IssuerAndSerialNumber)
+	if ee == nil {
+		return errors.New("pkcs7: No certificate for signer")
+	}
+	signingTime := time.Now().UTC()
+
 	hash, err := getHashForOID(signer.DigestAlgorithm.Algorithm)
 	if err != nil {
 		return err
 	}
+
 	if len(signer.AuthenticatedAttributes) > 0 {
 		// TODO(fullsailor): First check the content type match
 		var digest []byte
@@ -233,27 +254,57 @@ func verifySignature(p7 *PKCS7, signer signerInfo) error {
 		if err != nil {
 			return err
 		}
+
 		h := hash.New()
 		h.Write(p7.Content)
 		computed := h.Sum(nil)
+
 		if !hmac.Equal(digest, computed) {
 			return &MessageDigestMismatchError{
 				ExpectedDigest: digest,
 				ActualDigest:   computed,
 			}
 		}
-		// TODO(fullsailor): Optionally verify certificate chain
-		// TODO(fullsailor): Optionally verify signingTime against certificate NotAfter/NotBefore
+
+		if subtle.ConstantTimeCompare(digest, computed) != 1 {
+			return &MessageDigestMismatchError{
+				ExpectedDigest: digest,
+				ActualDigest:   computed,
+			}
+		}
+
 		signedData, err = marshalAttributes(signer.AuthenticatedAttributes)
 		if err != nil {
 			return err
 		}
+		err = unmarshalAttribute(signer.AuthenticatedAttributes, OIDAttributeSigningTime, &signingTime)
+		if err == nil {
+			// signing time found, performing validity check
+			if signingTime.After(ee.NotAfter) || signingTime.Before(ee.NotBefore) {
+				return fmt.Errorf("pkcs7: signing time %q is outside of certificate validity %q to %q",
+					signingTime.Format(time.RFC3339),
+					ee.NotBefore.Format(time.RFC3339),
+					ee.NotAfter.Format(time.RFC3339))
+			}
+		}
 	}
-	cert := getCertFromCertsByIssuerAndSerial(p7.Certificates, signer.IssuerAndSerialNumber)
-	if cert == nil {
-		return errors.New("pkcs7: No certificate for signer")
+	if trustStore != nil {
+		_, err = verifyCertChain(ee, p7.Certificates, trustStore, signingTime)
+		if err != nil {
+			return err
+		}
 	}
 
+	// sigalg, err := getSignatureAlgorithm(signer.DigestEncryptionAlgorithm, signer.DigestAlgorithm)
+	// if err != nil {
+	// 	return err
+	// }
+	// return ee.CheckSignature(sigalg, signedData, signer.EncryptedDigest)
+	// cert := getCertFromCertsByIssuerAndSerial(p7.Certificates, signer.IssuerAndSerialNumber)
+	// if cert == nil {
+	// 	return errors.New("pkcs7: No certificate for signer")
+	// }
+	//
 	algo := getSignatureAlgorithmFromAI(signer.DigestEncryptionAlgorithm)
 	if algo == x509.UnknownSignatureAlgorithm {
 		// I'm not sure what the spec here is, and the openssl sources were not
@@ -266,7 +317,7 @@ func verifySignature(p7 *PKCS7, signer signerInfo) error {
 			algo = getRSASignatureAlgorithmForDigestAlgorithm(hash)
 		}
 	}
-	return cert.CheckSignature(algo, signedData, signer.EncryptedDigest)
+	return ee.CheckSignature(algo, signedData, signer.EncryptedDigest)
 }
 
 func marshalAttributes(attrs []attribute) ([]byte, error) {
@@ -960,3 +1011,86 @@ func encryptKey(key []byte, recipient *x509.Certificate) ([]byte, error) {
 	}
 	return nil, ErrUnsupportedAlgorithm
 }
+
+////////////////////////////////
+//		ADDED
+////////////////////////////////
+
+func verifyCertChain(ee *x509.Certificate, certs []*x509.Certificate, truststore *x509.CertPool, currentTime time.Time) (chains [][]*x509.Certificate, err error) {
+	intermediates := x509.NewCertPool()
+	for _, intermediate := range certs {
+		intermediates.AddCert(intermediate)
+	}
+	verifyOptions := x509.VerifyOptions{
+		Roots:         truststore,
+		Intermediates: intermediates,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+		CurrentTime:   currentTime,
+	}
+	chains, err = ee.Verify(verifyOptions)
+	if err != nil {
+		return chains, fmt.Errorf("pkcs7: failed to verify certificate chain: %v", err)
+	}
+	return
+}
+
+// func getSignatureAlgorithm(digestEncryption, digest pkix.AlgorithmIdentifier) (x509.SignatureAlgorithm, error) {
+// 	switch {
+// 	case digestEncryption.Algorithm.Equal(OIDDigestAlgorithmECDSASHA1):
+// 		return x509.ECDSAWithSHA1, nil
+// 	case digestEncryption.Algorithm.Equal(OIDDigestAlgorithmECDSASHA256):
+// 		return x509.ECDSAWithSHA256, nil
+// 	case digestEncryption.Algorithm.Equal(OIDDigestAlgorithmECDSASHA384):
+// 		return x509.ECDSAWithSHA384, nil
+// 	case digestEncryption.Algorithm.Equal(OIDDigestAlgorithmECDSASHA512):
+// 		return x509.ECDSAWithSHA512, nil
+// 	case digestEncryption.Algorithm.Equal(OIDEncryptionAlgorithmRSA),
+// 		digestEncryption.Algorithm.Equal(OIDEncryptionAlgorithmRSASHA1),
+// 		digestEncryption.Algorithm.Equal(OIDEncryptionAlgorithmRSASHA256),
+// 		digestEncryption.Algorithm.Equal(OIDEncryptionAlgorithmRSASHA384),
+// 		digestEncryption.Algorithm.Equal(OIDEncryptionAlgorithmRSASHA512):
+// 		switch {
+// 		case digest.Algorithm.Equal(OIDDigestAlgorithmSHA1):
+// 			return x509.SHA1WithRSA, nil
+// 		case digest.Algorithm.Equal(OIDDigestAlgorithmSHA256):
+// 			return x509.SHA256WithRSA, nil
+// 		case digest.Algorithm.Equal(OIDDigestAlgorithmSHA384):
+// 			return x509.SHA384WithRSA, nil
+// 		case digest.Algorithm.Equal(OIDDigestAlgorithmSHA512):
+// 			return x509.SHA512WithRSA, nil
+// 		default:
+// 			return -1, fmt.Errorf("pkcs7: unsupported digest %q for encryption algorithm %q",
+// 				digest.Algorithm.String(), digestEncryption.Algorithm.String())
+// 		}
+// 	case digestEncryption.Algorithm.Equal(OIDDigestAlgorithmDSA),
+// 		digestEncryption.Algorithm.Equal(OIDDigestAlgorithmDSASHA1):
+// 		switch {
+// 		case digest.Algorithm.Equal(OIDDigestAlgorithmSHA1):
+// 			return x509.DSAWithSHA1, nil
+// 		case digest.Algorithm.Equal(OIDDigestAlgorithmSHA256):
+// 			return x509.DSAWithSHA256, nil
+// 		default:
+// 			return -1, fmt.Errorf("pkcs7: unsupported digest %q for encryption algorithm %q",
+// 				digest.Algorithm.String(), digestEncryption.Algorithm.String())
+// 		}
+// 	case digestEncryption.Algorithm.Equal(OIDEncryptionAlgorithmECDSAP256),
+// 		digestEncryption.Algorithm.Equal(OIDEncryptionAlgorithmECDSAP384),
+// 		digestEncryption.Algorithm.Equal(OIDEncryptionAlgorithmECDSAP521):
+// 		switch {
+// 		case digest.Algorithm.Equal(OIDDigestAlgorithmSHA1):
+// 			return x509.ECDSAWithSHA1, nil
+// 		case digest.Algorithm.Equal(OIDDigestAlgorithmSHA256):
+// 			return x509.ECDSAWithSHA256, nil
+// 		case digest.Algorithm.Equal(OIDDigestAlgorithmSHA384):
+// 			return x509.ECDSAWithSHA384, nil
+// 		case digest.Algorithm.Equal(OIDDigestAlgorithmSHA512):
+// 			return x509.ECDSAWithSHA512, nil
+// 		default:
+// 			return -1, fmt.Errorf("pkcs7: unsupported digest %q for encryption algorithm %q",
+// 				digest.Algorithm.String(), digestEncryption.Algorithm.String())
+// 		}
+// 	default:
+// 		return -1, fmt.Errorf("pkcs7: unsupported algorithm %q",
+// 			digestEncryption.Algorithm.String())
+// 	}
+// }
