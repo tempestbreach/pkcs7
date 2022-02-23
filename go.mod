@@ -1,3 +1,3 @@
-module pkcs7
+module github.com/tempestbreach/pkcs7
 
 go 1.17
